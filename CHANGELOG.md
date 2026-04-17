@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/dariogriffo/zunit/compare/v1.0.0...v2.0.0) (2026-04-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* update build to zig 0.16.0 ([#7](https://github.com/dariogriffo/zunit/issues/7))
+
+### Features
+
+* update build to zig 0.16.0 ([#7](https://github.com/dariogriffo/zunit/issues/7)) ([03ea08c](https://github.com/dariogriffo/zunit/commit/03ea08c5607b2fcd2c5183381cda173d44f58b34))
+
 ## [1.0.0](https://github.com/dariogriffo/zunit/compare/v0.2.0...v1.0.0) (2026-04-15)
 
 
