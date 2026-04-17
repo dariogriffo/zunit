@@ -24,7 +24,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.15.2"
+          version: "0.16.0"
 
       # Verify the library itself compiles and its own tests pass.
       - name: zunit internal tests
