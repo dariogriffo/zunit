@@ -75,7 +75,7 @@ pub fn run(config: Config) !void {
     var stats = RunStats{};
     const gpa = std.heap.page_allocator;
 
-    var records = std.ArrayList(TestRecord){};
+    var records: std.ArrayList(TestRecord) = .empty;
     defer records.deinit(gpa);
 
     // -------------------------------------------------------------------------
@@ -103,7 +103,7 @@ pub fn run(config: Config) !void {
     // -------------------------------------------------------------------------
     // 2. Gather unique file paths so we can scope per-file hooks
     // -------------------------------------------------------------------------
-    var file_paths = std.ArrayList([]const u8){};
+    var file_paths: std.ArrayList([]const u8) = .empty;
     defer file_paths.deinit(gpa);
 
     for (all_tests) |t| {
@@ -299,32 +299,39 @@ pub fn run(config: Config) !void {
 // -----------------------------------------------------------------------------
 
 /// Returns the value of `--output-file <path>` (or `--output-file=<path>`) from
-/// the process argv, or null if the flag is absent.
+/// the given argv, or null if the flag is absent.
+///
+/// In Zig 0.16, command-line arguments travel through `std.process.Init`
+/// (or the smaller `std.process.Init.Minimal`) passed to `main` — they are
+/// no longer accessible via a global like `std.process.argsAlloc`. Pass the
+/// `args` field straight through.
 ///
 /// Typical usage in test_runner.zig:
 ///
-///   try zunit.run(.{
-///       .output_file = try zunit.outputFileArg(std.heap.page_allocator),
-///   });
+///   pub fn main(init: std.process.Init.Minimal) !void {
+///       try zunit.run(.{
+///           .output_file = try zunit.outputFileArg(std.heap.page_allocator, init.args),
+///       });
+///   }
 ///
 /// Then run with:  zig build test -- --output-file results.xml
-pub fn outputFileArg(allocator: std.mem.Allocator) !?[]const u8 {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn outputFileArg(
+    allocator: std.mem.Allocator,
+    args: std.process.Args,
+) !?[]const u8 {
+    var it = try std.process.Args.Iterator.initAllocator(args, allocator);
+    defer it.deinit();
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-
+    _ = it.next(); // skip argv[0]
+    while (it.next()) |arg| {
         // --output-file=path
         if (std.mem.startsWith(u8, arg, "--output-file=")) {
             return try allocator.dupe(u8, arg["--output-file=".len..]);
         }
-
         // --output-file path
         if (std.mem.eql(u8, arg, "--output-file")) {
-            if (i + 1 < args.len) {
-                return try allocator.dupe(u8, args[i + 1]);
+            if (it.next()) |val| {
+                return try allocator.dupe(u8, val);
             }
         }
     }
@@ -457,7 +464,7 @@ fn writeJUnitXml(w: *std.Io.Writer, records: []const TestRecord, stats: RunStats
 
     // Collect unique file paths (preserving order)
     const gpa = std.heap.page_allocator;
-    var fps = std.ArrayList([]const u8){};
+    var fps: std.ArrayList([]const u8) = .empty;
     defer fps.deinit(gpa);
     for (records) |rec| {
         const fp = hooks.extractFilePath(rec.full_name);
