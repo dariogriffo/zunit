@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.1.0](https://github.com/dariogriffo/zunit/compare/v2.0.0...v2.1.0) (2026-04-19)
+
+### Features
+
+* **multi-binary test suites**: add `testSuite` build helper for fan-out test runs with automatic JUnit XML consolidation
+* **runner**: add `output_dir`, `run_id`, `consolidate_artifacts` fields to `Config`
+* **runner**: add `outputDirArg`, `runIdArg`, `consolidateArtifactsArg` CLI parsers
+* **merge**: add `merge.zig` with pure fragment-merge logic (flock-protected, atomic rename)
+
+### Notes
+
+* Fully backward-compatible with v2.0.0. All existing `Config.output_file` / `outputFileArg` usage is unchanged.
+* Windows: flock-based merge uses `Io.File.lock(.exclusive)` which delegates to `LockFileEx` via the Zig stdlib; no extra work needed.
+
 ## [2.0.0](https://github.com/dariogriffo/zunit/compare/v1.0.0...v2.0.0) (2026-04-17)
 
 

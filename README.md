@@ -318,6 +318,90 @@ zig build test -- --output-file=results.xml   # both forms are accepted
 
 ---
 
+## Multi-binary test suites
+
+When you fan out `zig build test` across many test binaries (one `b.addTest` per file), every process races to write the same `--output-file` path and only the last writer's results survive. zunit v2.1 solves this with automatic fragment consolidation: each binary writes its own JUnit fragment, and the last one to finish merges all fragments into a single file.
+
+### Quickstart
+
+In your `build.zig`:
+
+```zig
+const std = @import("std");
+const zunit_build = @import("zunit");   // build-time import
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const zunit_dep = b.dependency("zunit", .{ .target = target, .optimize = optimize });
+
+    const suite = zunit_build.testSuite(b, zunit_dep, .{
+        .target = target,
+        .optimize = optimize,
+        .output_file = "test-results.xml",    // merged output
+        .output_dir  = "zig-out/test-frags",  // per-binary fragments
+    });
+    suite.addFile("tests/foo_test.zig");
+    suite.addFile("tests/bar_test.zig");
+    // add as many files as you like
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(suite.step());
+}
+```
+
+Run with:
+
+```sh
+zig build test                 # runs all binaries, merges into test-results.xml
+```
+
+That's it. Each binary writes its own JUnit fragment under `zig-out/test-frags/<run-id>/`. The last binary to finish acquires an exclusive file lock and rewrites `test-results.xml` with the fully merged result. No `-- --output-file` passthrough needed.
+
+### How it works
+
+1. `testSuite` generates a shared `run_id` (a hex timestamp) at build time.
+2. For each `addFile`, it creates a test binary with a generated runner that reads `--output-dir`, `--run-id`, and `--consolidate-artifacts` from its argv.
+3. When a binary finishes its tests, it writes a JUnit fragment to `<output_dir>/<run_id>/<pid>.xml`.
+4. It then acquires an exclusive lock on `<output_dir>/<run_id>/.zunit-merge.lock`, reads all `*.xml` fragments in that directory, merges their `<testsuite>` elements into a single `<testsuites>` root with summed totals, and atomically renames the result to `<output_file>`.
+5. The lock is released. The merged file always reflects the union of all fragments written so far — the last writer is always correct.
+
+The exit code of each binary still reflects **that binary's own failures** only, so `zig build test` fails fast if any binary has a failing test.
+
+### Advanced: low-level flags
+
+If you prefer to wire things up manually (e.g. for custom runners), you can use the same CLI flags directly:
+
+```zig
+run_t.addArgs(&.{
+    "--output-file=test-results.xml",
+    "--output-dir=zig-out/test-frags",
+    "--run-id=my-shared-id",
+    "--consolidate-artifacts=true",
+});
+```
+
+The corresponding `Config` fields and arg parsers:
+
+```zig
+// In test_runner.zig
+try zunit.run(init.io, .{
+    .output_file          = try zunit.outputFileArg(alloc, init.minimal.args),
+    .output_dir           = try zunit.outputDirArg(alloc, init.minimal.args),
+    .run_id               = try zunit.runIdArg(alloc, init.minimal.args),
+    .consolidate_artifacts = try zunit.consolidateArtifactsArg(init.minimal.args),
+});
+```
+
+| Flag | Parser | Config field | Description |
+|------|--------|--------------|-------------|
+| `--output-dir=<path>` | `outputDirArg` | `output_dir` | Directory for per-binary fragments |
+| `--run-id=<id>` | `runIdArg` | `run_id` | Shared run identifier; auto-generated if absent |
+| `--consolidate-artifacts[=true]` | `consolidateArtifactsArg` | `consolidate_artifacts` | Enable merge-on-exit (requires both `output_file` and `output_dir`) |
+
+---
+
 ## Output examples
 
 ### Console (`verbose_timing`)
@@ -411,17 +495,18 @@ The JUnit XML format produced by zunit is also compatible with **Jenkins** (JUni
 ```
 zunit/
 ├── src/
-│   ├── zunit.zig          # public API (re-exports from runner + hooks)
-│   ├── runner.zig        # test orchestration, output, file writing
-│   └── hooks.zig         # hook name constants and classification helpers
+│   ├── zunit.zig          # public API (re-exports from runner + hooks + merge)
+│   ├── runner.zig         # test orchestration, output, fragment writing, consolidation
+│   ├── hooks.zig          # hook name constants and classification helpers
+│   └── merge.zig          # pure JUnit XML fragment merge logic
 ├── examples/
 │   └── basic/
 │       ├── src/
-│       │   ├── root.zig      # pulls math + strings into the test binary
-│       │   ├── math.zig      # math functions + per-file hooks + tests
-│       │   └── strings.zig   # string functions + per-file hooks + tests
-│       └── test_runner.zig   # example runner using outputFileArg
-├── build.zig
+│       │   ├── root.zig       # pulls math + strings into the single-binary example
+│       │   ├── math.zig       # math functions + per-file hooks + tests
+│       │   └── strings.zig    # string functions + per-file hooks + tests
+│       └── test_runner.zig    # example runner using outputFileArg
+├── build.zig                  # also contains testSuite() build helper (importable by consumers)
 ├── build.zig.zon
 └── .github/
     └── workflows/
@@ -430,12 +515,17 @@ zunit/
 
 ---
 
-## Running the example
+## Running the examples
 
 ```sh
+# Single-binary example (v2.0.0 API)
 zig build example                                    # run with console output
 zig build example -- --output-file results.xml      # + JUnit XML
 zig build example -- --output-file results.txt      # + plain text
+
+# Multi-binary suite example (v2.1.0 API)
+zig build example-suite   # runs math.zig and strings.zig as separate binaries,
+                          # merges into zig-out/example-suite-results.xml
 ```
 
 ---
@@ -465,7 +555,12 @@ pub const Config = struct {
     on_global_hook_failure: OnHookFailure = .abort,
     on_file_hook_failure:   OnHookFailure = .skip_remaining,
     output:                 OutputStyle   = .verbose,
+    // v2.0.0 single-writer path (unchanged)
     output_file:            ?[]const u8   = null,
+    // v2.1.0 multi-binary fragment path (new, optional)
+    output_dir:             ?[]const u8   = null,
+    run_id:                 ?[]const u8   = null,
+    consolidate_artifacts:  bool          = false,
     before_all:  ?*const fn () anyerror!void = null,
     after_all:   ?*const fn () anyerror!void = null,
     before_each: ?*const fn () anyerror!void = null,
@@ -474,4 +569,12 @@ pub const Config = struct {
 
 pub const OnHookFailure = enum { abort, skip_remaining, @"continue" };
 pub const OutputStyle    = enum { minimal, verbose, verbose_timing };
+
+// v2.1.0 CLI parsers
+pub fn outputDirArg(allocator: std.mem.Allocator, args: std.process.Args) !?[]const u8
+pub fn runIdArg(allocator: std.mem.Allocator, args: std.process.Args) !?[]const u8
+pub fn consolidateArtifactsArg(args: std.process.Args) !bool
+
+// v2.1.0 build helper (importable from consumer's build.zig via @import("zunit"))
+pub fn testSuite(b: *std.Build, zunit_dep: *std.Build.Dependency, opts: TestSuiteOptions) *TestSuite
 ```
