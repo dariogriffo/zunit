@@ -11,16 +11,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Internal tests for zunit itself
+    // Internal tests for zunit itself — dogfooded by running under zunit's
+    // own runner (src/test_runner.zig) so `zig build test` shows verbose
+    // PASS/FAIL output. Reuses zunit_mod as the test root so runner.zig and
+    // merge.zig (pulled in transitively) aren't duplicated across modules,
+    // and self-imports "zunit" so the runner's @import("zunit") resolves.
+    zunit_mod.addImport("zunit", zunit_mod);
+
     const lib_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zunit.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = zunit_mod,
+        .test_runner = .{
+            .path = b.path("src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
 
     const run_lib_tests = b.addRunArtifact(lib_tests);
+    if (b.args) |args| run_lib_tests.addArgs(args);
     const test_step = b.step("test", "Run zunit's own tests");
     test_step.dependOn(&run_lib_tests.step);
 
