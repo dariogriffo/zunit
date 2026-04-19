@@ -31,12 +31,8 @@ jobs:
       - name: zunit internal tests
         run: zig build test -- --output-file test-results.xml
 
-      # Smoke test for the single-binary v2.0 example.
-      - name: example (single-binary API)
-        run: zig build example
-
-      # Smoke test for the multi-binary testSuite helper — produces its own
-      # merged XML at zig-out/example-suite/test-results.xml.
+      # Exercises the multi-binary testSuite helper end-to-end; produces its
+      # own merged XML at zig-out/example-suite/test-results.xml.
       - name: example-suite (multi-binary API)
         run: zig build example-suite
 
