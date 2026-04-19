@@ -45,6 +45,11 @@ pub const Config = struct {
     /// If set, write test results to this file after the suite completes.
     /// When the path ends with ".xml" a JUnit-compatible XML report is generated;
     /// otherwise the output mirrors the console format.
+    ///
+    /// Path resolution: if this is a relative path and `output_dir` is also set,
+    /// the final path is `<output_dir>/<output_file>`. Absolute paths are used
+    /// as-is. When null and `consolidate_artifacts` is true, it defaults to
+    /// `"test-results.xml"` (resolved under `output_dir` per the rule above).
     output_file: ?[]const u8 = null,
 
     /// Directory where this process writes its own JUnit fragment.
@@ -58,7 +63,8 @@ pub const Config = struct {
 
     /// When true, after writing its own fragment, the process merges every
     /// fragment in `<output_dir>/<run_id>/` into `<output_file>`, flock-serialized.
-    /// Requires both `output_file` and `output_dir`; returns an error otherwise.
+    /// Requires `output_dir`; `output_file` defaults to `"test-results.xml"`
+    /// (relative to `output_dir`) when unset.
     consolidate_artifacts: bool = false,
 };
 
@@ -83,6 +89,34 @@ const TestRecord = struct {
     error_name: []const u8 = "",
 };
 
+/// Normalize output paths on the Config:
+///   1. If `consolidate_artifacts` is true and `output_file` is null,
+///      default `output_file` to `"test-results.xml"`.
+///   2. If both `output_dir` and `output_file` are set and `output_file`
+///      is a relative path, resolve it under `output_dir`. Absolute paths
+///      are left unchanged.
+///
+/// The returned Config may alias the input's string fields (no copy) when
+/// no path is synthesized, or own a newly-allocated joined path (leaked
+/// for the lifetime of the process; zunit exits immediately after `run`).
+fn resolveOutputPaths(alloc: std.mem.Allocator, config_in: Config) !Config {
+    var result = config_in;
+
+    if (result.consolidate_artifacts and result.output_file == null) {
+        result.output_file = "test-results.xml";
+    }
+
+    if (result.output_dir) |out_dir| {
+        if (result.output_file) |out_file| {
+            if (!std.fs.path.isAbsolute(out_file)) {
+                result.output_file = try std.fs.path.join(alloc, &.{ out_dir, out_file });
+            }
+        }
+    }
+
+    return result;
+}
+
 /// Run the full test suite with the given config.
 ///
 /// Call this from your test_runner.zig's `pub fn main(init: std.process.Init)`.
@@ -94,16 +128,16 @@ const TestRecord = struct {
 ///           .output_file = try zunit.outputFileArg(init.gpa, init.minimal.args),
 ///       });
 ///   }
-pub fn run(io: std.Io, config: Config) !void {
-    if (config.consolidate_artifacts) {
-        if (config.output_file == null or config.output_dir == null) {
-            return error.ConsolidateRequiresOutputFileAndDir;
-        }
+pub fn run(io: std.Io, config_in: Config) !void {
+    const gpa = std.heap.page_allocator;
+    const config = try resolveOutputPaths(gpa, config_in);
+
+    if (config.consolidate_artifacts and config.output_dir == null) {
+        return error.ConsolidateRequiresOutputDir;
     }
 
     const all_tests = builtin.test_functions;
     var stats = RunStats{};
-    const gpa = std.heap.page_allocator;
 
     var records: std.ArrayList(TestRecord) = .empty;
     defer records.deinit(gpa);
@@ -877,10 +911,51 @@ test "parseBoolValue" {
     try std.testing.expect(!parseBoolValue(""));
 }
 
-test "consolidate_artifacts validation: missing output_file" {
-    // Construct an io value using the test runner's io — but since we can't
-    // easily get one here without process.Init, we test the validation logic
-    // indirectly by checking the error type exists.
-    const err = error.ConsolidateRequiresOutputFileAndDir;
+test "resolveOutputPaths: defaults output_file when consolidating" {
+    const alloc = std.testing.allocator;
+    const out = try resolveOutputPaths(alloc, .{
+        .output_dir = "zig-out",
+        .consolidate_artifacts = true,
+    });
+    defer if (out.output_file) |p| alloc.free(p);
+
+    try std.testing.expect(out.output_file != null);
+    // Defaulted to test-results.xml, then joined under output_dir.
+    try std.testing.expectEqualStrings("zig-out/test-results.xml", out.output_file.?);
+}
+
+test "resolveOutputPaths: joins relative output_file under output_dir" {
+    const alloc = std.testing.allocator;
+    const out = try resolveOutputPaths(alloc, .{
+        .output_dir = "zig-out",
+        .output_file = "tests.xml",
+    });
+    defer if (out.output_file) |p| alloc.free(p);
+
+    try std.testing.expectEqualStrings("zig-out/tests.xml", out.output_file.?);
+}
+
+test "resolveOutputPaths: leaves absolute output_file alone" {
+    const out = try resolveOutputPaths(std.testing.allocator, .{
+        .output_dir = "zig-out",
+        .output_file = "/tmp/tests.xml",
+    });
+    try std.testing.expectEqualStrings("/tmp/tests.xml", out.output_file.?);
+}
+
+test "resolveOutputPaths: no-op when output_dir is null" {
+    const out = try resolveOutputPaths(std.testing.allocator, .{
+        .output_file = "tests.xml",
+    });
+    try std.testing.expectEqualStrings("tests.xml", out.output_file.?);
+}
+
+test "resolveOutputPaths: no-op when neither flag set" {
+    const out = try resolveOutputPaths(std.testing.allocator, .{});
+    try std.testing.expect(out.output_file == null);
+}
+
+test "ConsolidateRequiresOutputDir error exists" {
+    const err = error.ConsolidateRequiresOutputDir;
     try std.testing.expectError(err, @as(anyerror!void, err));
 }

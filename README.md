@@ -4,17 +4,252 @@ A custom test runner and lifecycle library for Zig. It replaces the built-in tes
 
 **How it works:** Zig lets you swap the default test runner by pointing your build at a file that provides `pub fn main()`. zunit's runner is that file — it receives all test functions via `builtin.test_functions`, manages the full hook lifecycle around each one, tracks results, and controls the process exit code. Your `test_runner.zig` simply calls `zunit.run(...)` with whatever configuration you need.
 
-> **Zig version support**
->
-> | zunit tag | Zig versions     |
-> | --------- | ---------------- |
-> | `v2.x`    | `0.16.0` and up  |
-> | `v1.0.0`  | `0.15.2`         |
->
-> Pick the tag that matches your compiler. The two lines have different APIs
-> — `v2.0.0` reworked `zunit.run` to take an `std.Io` parameter because all
-> clock and file I/O moved into the `std.Io` interface in Zig 0.16. See the
-> [Installation](#installation) section for the exact pin.
+> **Zig version support.** zunit `v2.x` targets Zig `0.16.0` and up. Every
+> example in this README is written against the v2 API.
+
+---
+
+## Examples
+
+Each example is self-contained and builds on the previous. The first few cover the single-binary case; the later ones show the multi-binary `testSuite` helper.
+
+### 1. Minimal `test_runner.zig`
+
+The shortest runner you can write — every `Config` field has a sensible default:
+
+```zig
+const std = @import("std");
+const zunit = @import("zunit");
+
+pub fn main(init: std.process.Init) !void {
+    try zunit.run(init.io, .{});
+}
+```
+
+Point `build.zig` at this file as the test runner (see [Installation](#installation)) and `zig build test` prints `PASS` / `FAIL` / `SKIP` per test and exits non-zero on failure.
+
+### 2. Choosing an output style
+
+```zig
+try zunit.run(init.io, .{ .output = .verbose_timing });
+```
+
+| Style | Output |
+|---|---|
+| `.minimal` | Final line: `N passed  N failed  N skipped` |
+| `.verbose` | One `PASS` / `FAIL` / `SKIP` line per test (default) |
+| `.verbose_timing` | Verbose + nanosecond-precision elapsed time per test |
+
+### 3. Writing JUnit XML to a file
+
+Pass a path ending in `.xml`:
+
+```zig
+try zunit.run(init.io, .{ .output_file = "results.xml" });
+```
+
+Any other extension writes plain text that mirrors the console output. Relative paths resolve against the process working directory.
+
+### 4. Accepting the output path from the command line
+
+Let users and CI pick the output path at run time without recompiling:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    try zunit.run(init.io, .{
+        .output_file = try zunit.outputFileArg(
+            init.arena.allocator(),
+            init.minimal.args,
+        ),
+    });
+}
+```
+
+```sh
+zig build test -- --output-file results.xml
+zig build test -- --output-file=/tmp/results.xml   # both forms accepted
+```
+
+Pass `init.arena.allocator()` so the parsed string lives until process exit with no manual cleanup.
+
+### 5. Per-file hooks
+
+Name a test block `beforeAll`, `afterAll`, `beforeEach`, or `afterEach` — zunit scopes it to that source file automatically:
+
+```zig
+const std = @import("std");
+
+test "beforeAll" { std.debug.print("db: connect\n", .{}); }
+test "afterAll"  { std.debug.print("db: close\n",   .{}); }
+test "beforeEach" { /* reset state */ }
+test "afterEach"  { /* log query count */ }
+
+test "users.create inserts a row" { /* ... */ }
+test "users.delete cascades"      { /* ... */ }
+```
+
+### 6. Global hooks (naming convention)
+
+Prefix with `zunit:` to apply a hook across every file in the suite. Put it wherever makes sense — `src/root.zig` is conventional:
+
+```zig
+test "zunit:beforeAll"  { /* once, before the entire suite */ }
+test "zunit:afterAll"   { /* once, after the entire suite */ }
+test "zunit:beforeEach" { /* before every test in every file */ }
+test "zunit:afterEach"  { /* after every test in every file */ }
+```
+
+### 7. Global hooks (programmatic)
+
+Function pointers on `Config` run **before** the naming-convention hooks — useful when setup depends on imports or closures that a `test` block can't express:
+
+```zig
+fn setupDb()    !void { /* ... */ }
+fn teardownDb() !void { /* ... */ }
+
+pub fn main(init: std.process.Init) !void {
+    try zunit.run(init.io, .{
+        .before_all = setupDb,
+        .after_all  = teardownDb,
+    });
+}
+```
+
+### 8. Controlling hook failure behaviour
+
+```zig
+try zunit.run(init.io, .{
+    .on_global_hook_failure = .abort,           // default
+    .on_file_hook_failure   = .skip_remaining,  // default
+});
+```
+
+| Value | Behaviour |
+|---|---|
+| `.abort` | Print the error and exit the process immediately |
+| `.skip_remaining` | Skip the rest of the affected scope (file for per-file hooks, suite for global) |
+| `.@"continue"` | Log the error and keep running |
+
+### 9. Multi-binary test suite — simplest case
+
+When `zig build test` fans out into many test binaries (one `b.addTest` per file), every process races for the same `--output-file` path and only the last writer survives. The `testSuite` build helper solves this with automatic fragment consolidation — no CLI flags at run time:
+
+```zig
+// build.zig
+const std = @import("std");
+const zunit_build = @import("zunit");   // build-time import
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const zunit_dep = b.dependency("zunit", .{ .target = target, .optimize = optimize });
+    const suite = zunit_build.testSuite(b, zunit_dep, .{
+        .target = target,
+        .optimize = optimize,
+    });
+    suite.addFile("tests/users_test.zig");
+    suite.addFile("tests/orders_test.zig");
+
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(suite.step());
+}
+```
+
+```sh
+zig build test
+```
+
+All tests run across separate binaries, each writes its own JUnit fragment under `zig-out/test-fragments/<run-id>/`, and the last binary to finish merges them into `zig-out/test-fragments/test-results.xml`.
+
+### 10. Multi-binary with shared module imports
+
+If every test binary needs the same set of `@import` names, declare them once:
+
+```zig
+const suite = zunit_build.testSuite(b, zunit_dep, .{
+    .target = target,
+    .optimize = optimize,
+    .imports = &.{
+        .{ .name = "app",     .module = app_module },
+        .{ .name = "storage", .module = storage_module },
+    },
+});
+suite.addFile("tests/users_test.zig");    // sees @import("app") and @import("storage")
+suite.addFile("tests/orders_test.zig");
+```
+
+### 11. Custom output paths
+
+```zig
+const suite = zunit_build.testSuite(b, zunit_dep, .{
+    .target = target,
+    .optimize = optimize,
+    .output_dir  = "zig-out/ci",
+    .output_file = "junit.xml",   // relative → resolves to zig-out/ci/junit.xml
+});
+```
+
+### 12. Relative vs absolute `output_file`
+
+When `output_file` is **relative**, zunit resolves it under `output_dir`:
+
+```
+output_dir  = "zig-out/ci"
+output_file = "junit.xml"
+→ merged XML at zig-out/ci/junit.xml
+```
+
+When it's **absolute**, it's used as-is:
+
+```
+output_dir  = "zig-out/ci"
+output_file = "/tmp/junit.xml"
+→ merged XML at /tmp/junit.xml
+```
+
+The same rule applies to the `--output-file` CLI flag.
+
+### 13. Defaulting `output_file` with `--consolidate-artifacts`
+
+Passing `--consolidate-artifacts` without `--output-file` defaults to `test-results.xml` — which, per the rule above, resolves under `--output-dir`:
+
+```sh
+your-test-binary --output-dir=zig-out --consolidate-artifacts=true
+# merged XML lands at zig-out/test-results.xml
+```
+
+### 14. Low-level: driving consolidation from CLI flags
+
+If you run zunit outside of the `testSuite` helper (custom runners, non-Zig build systems, manual fan-out), the same consolidation works via CLI flags directly. Each process writes its own fragment and the last one finishes the merge:
+
+```sh
+your-test-binary \
+  --output-dir=zig-out/frags \
+  --run-id=$CI_JOB_ID \
+  --consolidate-artifacts=true \
+  --output-file=results.xml
+```
+
+| Flag | `Config` field | Description |
+|---|---|---|
+| `--output-file=<path>` | `output_file` | Final merged JUnit XML (relative → resolved under `--output-dir`; defaults to `test-results.xml` when `--consolidate-artifacts` is set) |
+| `--output-dir=<path>` | `output_dir` | Directory for per-binary fragments; also the base for a relative `output_file` |
+| `--run-id=<id>` | `run_id` | Shared identifier for one consolidated run (generated per-process if unset) |
+| `--consolidate-artifacts[=true]` | `consolidate_artifacts` | Enable merge-on-exit (requires `--output-dir`) |
+
+In `test_runner.zig`, the corresponding parsers:
+
+```zig
+try zunit.run(init.io, .{
+    .output_file           = try zunit.outputFileArg(alloc, init.minimal.args),
+    .output_dir            = try zunit.outputDirArg(alloc, init.minimal.args),
+    .run_id                = try zunit.runIdArg(alloc, init.minimal.args),
+    .consolidate_artifacts = try zunit.consolidateArtifactsArg(init.minimal.args),
+});
+```
+
+If you're using `testSuite`, this runner file is generated for you.
 
 ---
 
@@ -27,49 +262,27 @@ A custom test runner and lifecycle library for Zig. It replaces the built-in tes
 - **Three output styles** — minimal summary, verbose per-test, or verbose with nanosecond-precision timing
 - **File output** — write results to a plain text file or a JUnit-compatible XML report for CI dashboards
 - **`--output-file` CLI flag** — pass the report path at runtime without recompiling
+- **Multi-binary consolidation** — `testSuite` helper merges JUnit fragments from many test binaries into one report
 - **Memory leak detection** — resets and checks `std.testing.allocator_instance` around every test
 
 ---
 
 ## Installation
 
-Add zunit to your `build.zig.zon`. The easiest way is `zig fetch`, which writes both the URL and the integrity hash for you. **Pick the line that matches your Zig version:**
-
-### Zig 0.16.0 and later
+Add zunit to your `build.zig.zon`. The easiest way is `zig fetch`, which writes both the URL and the integrity hash for you:
 
 ```sh
-zig fetch --save git+https://github.com/dariogriffo/zunit#v2.0.0
+zig fetch --save git+https://github.com/dariogriffo/zunit#v2.1.1
 ```
 
 ```zig
 .dependencies = .{
     .zunit = .{
-        .url  = "git+https://github.com/dariogriffo/zunit#v2.0.0",
+        .url  = "git+https://github.com/dariogriffo/zunit#v2.1.1",
         .hash = "<filled in by zig fetch>",
     },
 },
 ```
-
-### Zig 0.15.2
-
-```sh
-zig fetch --save git+https://github.com/dariogriffo/zunit#v1.0.0
-```
-
-```zig
-.dependencies = .{
-    .zunit = .{
-        .url  = "git+https://github.com/dariogriffo/zunit#v1.0.0",
-        .hash = "<filled in by zig fetch>",
-    },
-},
-```
-
-> The `v1.x` and `v2.x` lines have different runtime APIs. The setup snippet
-> in this README is for **v2.x (Zig 0.16+)**. If you are on Zig 0.15.2,
-> consult the [v1.0.0 README](https://github.com/dariogriffo/zunit/blob/v1.0.0/README.md)
-> — `pub fn main()` takes no parameters there, and `zunit.run` takes only
-> the config (no `io`).
 
 In `build.zig`, fetch the dependency, expose the module, and wire it into your test step:
 
@@ -96,43 +309,7 @@ const test_step = b.step("test", "Run tests");
 test_step.dependOn(&run_tests.step);
 ```
 
-> `if (b.args) |args| run_tests.addArgs(args);` is required to forward `--output-file` (and any future flags) from `zig build test -- ...` to the runner binary.
-
----
-
-## Setup
-
-Create `test_runner.zig` in your project root. This file becomes the entry point of the test binary — it *is* the runner. It's the only file you need to write:
-
-```zig
-const std = @import("std");
-const zunit = @import("zunit");
-
-pub fn main(init: std.process.Init) !void {
-    try zunit.run(init.io, .{
-        .on_global_hook_failure = .abort,
-        .on_file_hook_failure   = .skip_remaining,
-        .output                 = .verbose_timing,
-        .output_file = try zunit.outputFileArg(
-            init.arena.allocator(),
-            init.minimal.args,
-        ),
-    });
-}
-```
-
-> Why `std.process.Init`? In Zig 0.16, clocks and file I/O go through the
-> `std.Io` interface, and command-line arguments arrive via
-> `std.process.Init`. zunit needs both, so its `main` takes the full `Init`
-> and forwards `init.io` and `init.minimal.args`.
-
-Run your tests:
-
-```sh
-zig build test                                       # console output only
-zig build test -- --output-file results.xml         # + JUnit XML report
-zig build test -- --output-file results.txt         # + plain text report
-```
+> `if (b.args) |args| run_tests.addArgs(args);` is required to forward `--output-file` (and any future flags) from `zig build test -- ...` to the runner binary. If you're using the `testSuite` helper (example 9 above), this is handled for you.
 
 ---
 
@@ -140,77 +317,15 @@ zig build test -- --output-file results.txt         # + plain text report
 
 ### Per-file hooks
 
-Declare hooks as named test blocks anywhere in a `.zig` source file. zunit automatically scopes them to tests **in that file only**, matched by the module path prefix embedded in each test's full name.
-
-```zig
-const std = @import("std");
-
-test "beforeAll" {
-    // runs once before all tests in this file
-    std.debug.print("setting up\n", .{});
-}
-
-test "afterAll" {
-    // runs once after all tests in this file
-}
-
-test "beforeEach" {
-    // runs before every individual test in this file
-}
-
-test "afterEach" {
-    // runs after every individual test in this file
-}
-
-test "my feature works" {
-    // actual test — preceded by beforeEach, followed by afterEach
-}
-```
+Declare hooks as named test blocks anywhere in a `.zig` source file. zunit automatically scopes them to tests **in that file only**, matched by the module path prefix embedded in each test's full name. See [example 5](#5-per-file-hooks) for a complete sample.
 
 ### Global hooks (naming convention)
 
-Prefix with `zunit:` to make a hook apply to **all tests across all files**. Put them in whichever file makes sense for your project (e.g. `src/root.zig`):
-
-```zig
-test "zunit:beforeAll" {
-    // runs once before the entire suite starts
-}
-
-test "zunit:afterAll" {
-    // runs once after the entire suite finishes
-}
-
-test "zunit:beforeEach" {
-    // runs before every test in every file
-}
-
-test "zunit:afterEach" {
-    // runs after every test in every file
-}
-```
+Prefix with `zunit:` to make a hook apply to **all tests across all files**. See [example 6](#6-global-hooks-naming-convention).
 
 ### Global hooks (programmatic)
 
-Pass functions directly to `zunit.run(...)`. These run **before** the corresponding naming-convention global hooks:
-
-```zig
-fn setupDatabase() !void {
-    // spin up a test DB, open a file, etc.
-}
-
-fn teardownDatabase() !void { ... }
-fn resetState() !void { ... }
-fn flushLogs() !void { ... }
-
-pub fn main(init: std.process.Init) !void {
-    try zunit.run(init.io, .{
-        .before_all  = setupDatabase,
-        .after_all   = teardownDatabase,
-        .before_each = resetState,
-        .after_each  = flushLogs,
-    });
-}
-```
+Pass functions directly to `zunit.run(...)`. These run **before** the corresponding naming-convention global hooks. See [example 7](#7-global-hooks-programmatic).
 
 ---
 
@@ -252,153 +367,45 @@ Hook test blocks (all `beforeAll`, `afterAll`, etc.) are **never counted** in th
 
 ## Configuration reference
 
-Pass a `Config` literal as the second argument to `zunit.run(io, config)`. All fields have defaults so you only need to specify what you want to change.
+Pass a `Config` literal as the second argument to `zunit.run(io, config)`. All fields have defaults, so you only need to specify what you want to change.
 
 ```zig
 try zunit.run(init.io, .{
-    .on_global_hook_failure = .abort,          // default
-    .on_file_hook_failure   = .skip_remaining, // default
-    .output                 = .verbose,        // default
-    .output_file            = null,            // default
+    // Output
+    .output                 = .verbose,        // .minimal | .verbose | .verbose_timing
+    .output_file            = null,            // []const u8 or null
+
+    // Hook failure behaviour
+    .on_global_hook_failure = .abort,          // .abort | .skip_remaining | .@"continue"
+    .on_file_hook_failure   = .skip_remaining,
+
+    // Programmatic global hooks
     .before_all  = null,
     .after_all   = null,
     .before_each = null,
     .after_each  = null,
+
+    // Multi-binary consolidation (usually set by the testSuite helper, not by hand)
+    .output_dir            = null,
+    .run_id                = null,
+    .consolidate_artifacts = false,
 });
 ```
 
-### `OnHookFailure`
-
-Controls what happens when a lifecycle hook returns an error.
-
-| Value             | Behaviour |
-|-------------------|-----------|
-| `.abort`          | Print the error and exit the process immediately |
-| `.skip_remaining` | Skip all remaining tests in the affected scope (file for per-file hooks, entire suite for global hooks) |
-| `.@"continue"`    | Log the error and keep running |
-
-`on_global_hook_failure` defaults to `.abort`; `on_file_hook_failure` defaults to `.skip_remaining`.
-
-### `OutputStyle`
-
-| Value             | What is printed |
-|-------------------|-----------------|
-| `.minimal`        | A single final line: `N passed  N failed  N skipped` |
-| `.verbose`        | One `PASS` / `FAIL` / `SKIP` line per test |
-| `.verbose_timing` | Same as verbose, plus elapsed time per test (`123ns` / `1.2µs` / `1.234ms`) |
-
-### `output_file`
-
-When set, results are written to the given path **in addition to** the normal stderr output.
-
-- Path ending in **`.xml`** → JUnit-compatible XML (works with GitHub Actions, Jenkins, GitLab CI, etc.)
-- Any other extension → plain text mirroring the console output
-
-Set it at compile time:
-
-```zig
-.output_file = "results.xml",
-```
-
-Or read it from the command line at runtime with the `outputFileArg` helper. Pass `init.minimal.args` so it can scan the process argv, and `init.arena.allocator()` so the parsed path lives until process exit without manual cleanup:
-
-```zig
-.output_file = try zunit.outputFileArg(
-    init.arena.allocator(),
-    init.minimal.args,
-),
-```
-
-Then pass it when running:
-
-```sh
-zig build test -- --output-file results.xml
-zig build test -- --output-file=results.xml   # both forms are accepted
-```
+See the [multi-binary examples](#9-multi-binary-test-suite--simplest-case) for how `output_dir`, `run_id`, and `consolidate_artifacts` interact.
 
 ---
 
-## Multi-binary test suites
+## How consolidation works
 
-When you fan out `zig build test` across many test binaries (one `b.addTest` per file), every process races to write the same `--output-file` path and only the last writer's results survive. zunit v2.1 solves this with automatic fragment consolidation: each binary writes its own JUnit fragment, and the last one to finish merges all fragments into a single file.
+When `testSuite` (or the equivalent CLI flags) wire up multi-binary consolidation:
 
-### Quickstart
-
-In your `build.zig`:
-
-```zig
-const std = @import("std");
-const zunit_build = @import("zunit");   // build-time import
-
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    const zunit_dep = b.dependency("zunit", .{ .target = target, .optimize = optimize });
-
-    const suite = zunit_build.testSuite(b, zunit_dep, .{
-        .target = target,
-        .optimize = optimize,
-        .output_file = "test-results.xml",    // merged output
-        .output_dir  = "zig-out/test-frags",  // per-binary fragments
-    });
-    suite.addFile("tests/foo_test.zig");
-    suite.addFile("tests/bar_test.zig");
-    // add as many files as you like
-
-    const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(suite.step());
-}
-```
-
-Run with:
-
-```sh
-zig build test                 # runs all binaries, merges into test-results.xml
-```
-
-That's it. Each binary writes its own JUnit fragment under `zig-out/test-frags/<run-id>/`. The last binary to finish acquires an exclusive file lock and rewrites `test-results.xml` with the fully merged result. No `-- --output-file` passthrough needed.
-
-### How it works
-
-1. `testSuite` generates a shared `run_id` (a hex timestamp) at build time.
-2. For each `addFile`, it creates a test binary with a generated runner that reads `--output-dir`, `--run-id`, and `--consolidate-artifacts` from its argv.
-3. When a binary finishes its tests, it writes a JUnit fragment to `<output_dir>/<run_id>/<pid>.xml`.
-4. It then acquires an exclusive lock on `<output_dir>/<run_id>/.zunit-merge.lock`, reads all `*.xml` fragments in that directory, merges their `<testsuite>` elements into a single `<testsuites>` root with summed totals, and atomically renames the result to `<output_file>`.
-5. The lock is released. The merged file always reflects the union of all fragments written so far — the last writer is always correct.
+1. `testSuite` generates a shared `run_id` (a hex timestamp) at build time and passes it to every test binary as `--run-id=<id>`.
+2. Each binary runs its tests, then writes a self-contained JUnit fragment to `<output_dir>/<run_id>/<pid>.xml`.
+3. It acquires an exclusive lock on `<output_dir>/<run_id>/.zunit-merge.lock`, reads every `*.xml` fragment in that directory, merges their `<testsuite>` elements into a single `<testsuites>` root with summed totals, and atomically renames the result to `<output_file>` (resolved per [example 12](#12-relative-vs-absolute-output_file)).
+4. The lock is released. Every process performs steps 2–4; the last writer wins, and the merged file always reflects the union of all fragments.
 
 The exit code of each binary still reflects **that binary's own failures** only, so `zig build test` fails fast if any binary has a failing test.
-
-### Advanced: low-level flags
-
-If you prefer to wire things up manually (e.g. for custom runners), you can use the same CLI flags directly:
-
-```zig
-run_t.addArgs(&.{
-    "--output-file=test-results.xml",
-    "--output-dir=zig-out/test-frags",
-    "--run-id=my-shared-id",
-    "--consolidate-artifacts=true",
-});
-```
-
-The corresponding `Config` fields and arg parsers:
-
-```zig
-// In test_runner.zig
-try zunit.run(init.io, .{
-    .output_file          = try zunit.outputFileArg(alloc, init.minimal.args),
-    .output_dir           = try zunit.outputDirArg(alloc, init.minimal.args),
-    .run_id               = try zunit.runIdArg(alloc, init.minimal.args),
-    .consolidate_artifacts = try zunit.consolidateArtifactsArg(init.minimal.args),
-});
-```
-
-| Flag | Parser | Config field | Description |
-|------|--------|--------------|-------------|
-| `--output-dir=<path>` | `outputDirArg` | `output_dir` | Directory for per-binary fragments |
-| `--run-id=<id>` | `runIdArg` | `run_id` | Shared run identifier; auto-generated if absent |
-| `--consolidate-artifacts[=true]` | `consolidateArtifactsArg` | `consolidate_artifacts` | Enable merge-on-exit (requires both `output_file` and `output_dir`) |
 
 ---
 
@@ -458,12 +465,12 @@ zunit resets `std.testing.allocator_instance` before each test and checks for le
 The repository ships a ready-to-use workflow at `.github/workflows/ci.yml` that:
 
 1. Runs `zig build test` (zunit's own internal tests)
-2. Runs the example suite with `--output-file test-results.xml`
+2. Runs the multi-binary example suite and produces a merged JUnit XML
 3. Uploads the XML as a workflow artifact
 4. Publishes per-test pass/fail to the PR **Checks** tab via [`dorny/test-reporter`](https://github.com/dorny/test-reporter)
 5. Writes a markdown pass/fail table to the **job summary** page
 
-To use the same pattern in your own project, add to your workflow:
+To use the same pattern in your own project (single-binary case):
 
 ```yaml
 - name: Run tests
@@ -486,6 +493,8 @@ To use the same pattern in your own project, add to your workflow:
     fail-on-error: false
 ```
 
+If you're using the `testSuite` helper, drop the `-- --output-file …` from the run step and point `path:` at `zig-out/test-fragments/test-results.xml` (or wherever your `output_dir` / `output_file` resolved to).
+
 The JUnit XML format produced by zunit is also compatible with **Jenkins** (JUnit plugin), **GitLab CI** (`junit` artifact reports), and any other tool that reads the standard JUnit schema.
 
 ---
@@ -506,7 +515,7 @@ zunit/
 │       │   ├── math.zig       # math functions + per-file hooks + tests
 │       │   └── strings.zig    # string functions + per-file hooks + tests
 │       └── test_runner.zig    # example runner using outputFileArg
-├── build.zig                  # also contains testSuite() build helper (importable by consumers)
+├── build.zig                  # also exposes the testSuite() build helper
 ├── build.zig.zon
 └── .github/
     └── workflows/
@@ -518,14 +527,14 @@ zunit/
 ## Running the examples
 
 ```sh
-# Single-binary example (v2.0.0 API)
-zig build example                                    # run with console output
+# Single-binary example (basic test_runner.zig usage)
+zig build example                                    # console output
 zig build example -- --output-file results.xml      # + JUnit XML
 zig build example -- --output-file results.txt      # + plain text
 
-# Multi-binary suite example (v2.1.0 API)
-zig build example-suite   # runs math.zig and strings.zig as separate binaries,
-                          # merges into zig-out/example-suite-results.xml
+# Multi-binary suite example (testSuite helper)
+zig build example-suite
+# merged JUnit XML lands at zig-out/example-suite/test-results.xml
 ```
 
 ---
@@ -542,25 +551,25 @@ const zunit = @import("zunit");
 // and JUnit-XML file writes.
 pub fn run(io: std.Io, config: Config) !void
 
-// Parse --output-file <path> or --output-file=<path> from the given argv.
-// Returns null if the flag is absent. The returned slice is allocated with
-// the given allocator and owned by the caller; pair with init.arena to let
-// the process arena free it on exit.
-pub fn outputFileArg(
-    allocator: std.mem.Allocator,
-    args: std.process.Args,
-) !?[]const u8
+// CLI flag parsers. All return the parsed value, or null (or false) when
+// the flag is absent. String results are allocated with the given allocator
+// and owned by the caller; pair with init.arena to let the process arena
+// free them on exit.
+pub fn outputFileArg(          allocator, args) !?[]const u8
+pub fn outputDirArg(           allocator, args) !?[]const u8
+pub fn runIdArg(               allocator, args) !?[]const u8
+pub fn consolidateArtifactsArg(args)             !bool
 
 pub const Config = struct {
     on_global_hook_failure: OnHookFailure = .abort,
     on_file_hook_failure:   OnHookFailure = .skip_remaining,
     output:                 OutputStyle   = .verbose,
-    // v2.0.0 single-writer path (unchanged)
+
     output_file:            ?[]const u8   = null,
-    // v2.1.0 multi-binary fragment path (new, optional)
     output_dir:             ?[]const u8   = null,
     run_id:                 ?[]const u8   = null,
     consolidate_artifacts:  bool          = false,
+
     before_all:  ?*const fn () anyerror!void = null,
     after_all:   ?*const fn () anyerror!void = null,
     before_each: ?*const fn () anyerror!void = null,
@@ -568,13 +577,18 @@ pub const Config = struct {
 };
 
 pub const OnHookFailure = enum { abort, skip_remaining, @"continue" };
-pub const OutputStyle    = enum { minimal, verbose, verbose_timing };
+pub const OutputStyle   = enum { minimal, verbose, verbose_timing };
 
-// v2.1.0 CLI parsers
-pub fn outputDirArg(allocator: std.mem.Allocator, args: std.process.Args) !?[]const u8
-pub fn runIdArg(allocator: std.mem.Allocator, args: std.process.Args) !?[]const u8
-pub fn consolidateArtifactsArg(args: std.process.Args) !bool
+// Build helper — importable from a consumer's build.zig via @import("zunit").
+pub fn testSuite(
+    b: *std.Build,
+    zunit_dep: *std.Build.Dependency,
+    opts: TestSuiteOptions,
+) *TestSuite
 
-// v2.1.0 build helper (importable from consumer's build.zig via @import("zunit"))
-pub fn testSuite(b: *std.Build, zunit_dep: *std.Build.Dependency, opts: TestSuiteOptions) *TestSuite
+pub fn testSuiteFromModule(
+    b: *std.Build,
+    zunit_mod: *std.Build.Module,
+    opts: TestSuiteOptions,
+) *TestSuite
 ```

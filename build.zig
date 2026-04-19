@@ -52,11 +52,15 @@ pub fn build(b: *std.Build) void {
     // -------------------------------------------------------------------------
     // Example: suite (demonstrates multi-binary testSuite helper)
     // Run with:  zig build example-suite
-    // Produces: zig-out/example-suite-results.xml (merged JUnit from 2 binaries)
+    // Produces: zig-out/example-suite/test-results.xml (merged JUnit from 2 binaries)
     //
-    // This dogfoods the testSuite helper via `testSuiteFromModule`, which is
-    // the module-based variant. In a real consumer project you'd use
-    // `testSuite` instead:
+    // `output_file` defaults to "test-results.xml" when consolidating and a
+    // relative `output_file` is resolved under `output_dir`, so the merged XML
+    // lands at `zig-out/example-suite/test-results.xml` without any explicit
+    // path. This is the intended idiomatic usage.
+    //
+    // Dogfoods the testSuite helper via `testSuiteFromModule` (module-based
+    // variant). In a real consumer project you'd use `testSuite` instead:
     //
     //   const zunit_build = @import("zunit");
     //   const zunit_dep = b.dependency("zunit", .{ .target = target, .optimize = optimize });
@@ -65,8 +69,7 @@ pub fn build(b: *std.Build) void {
     const example_suite = testSuiteFromModule(b, zunit_mod, .{
         .target = target,
         .optimize = optimize,
-        .output_file = "zig-out/example-suite-results.xml",
-        .output_dir = "zig-out/example-suite-fragments",
+        .output_dir = "zig-out/example-suite",
     });
     example_suite.addFile("examples/basic/src/math.zig");
     example_suite.addFile("examples/basic/src/strings.zig");
@@ -100,9 +103,15 @@ pub const Import = struct {
 pub const TestSuiteOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    /// Final merged JUnit XML output path, relative to the build root.
+    /// Final merged JUnit XML output path. If relative, it is resolved under
+    /// `output_dir` at runtime (so the default `"test-results.xml"` lands at
+    /// `<output_dir>/test-results.xml`). Pass an absolute path to write
+    /// elsewhere.
     output_file: []const u8 = "test-results.xml",
-    /// Intermediate directory for per-binary fragments, relative to build root.
+    /// Intermediate directory for per-binary fragments, relative to build
+    /// root. Fragments live in `<output_dir>/<run_id>/*.xml` and the merged
+    /// XML lands at `<output_dir>/<output_file>` (when `output_file` is
+    /// relative).
     output_dir: []const u8 = "zig-out/test-fragments",
     /// Shared imports applied to every test binary.
     imports: []const Import = &.{},
