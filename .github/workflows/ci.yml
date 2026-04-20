@@ -29,12 +29,7 @@ jobs:
       # zunit's own internal tests, driven by zunit's runner (dogfood).
       # `-- --output-file …` emits JUnit XML for CI reporting.
       - name: zunit internal tests
-        run: zig build test -- --output-file test-results.xml
-
-      # Exercises the multi-binary testSuite helper end-to-end; produces its
-      # own merged XML at zig-out/example-suite/test-results.xml.
-      - name: example-suite (multi-binary API)
-        run: zig build example-suite
+        run: zig build test -- --output-dir zig-out/tests --consolidate-artifacts=true
 
       # Upload both XMLs as artifacts for later inspection.
       - name: Upload test results
@@ -44,7 +39,7 @@ jobs:
           name: test-results
           path: |
             test-results.xml
-            zig-out/example-suite/test-results.xml
+            zig-out/tests/test-results.xml
           retention-days: 30
 
       # Publish JUnit results as a GitHub check — shows pass/fail per test
@@ -56,8 +51,7 @@ jobs:
         with:
           name: Test Results
           path: |
-            test-results.xml
-            zig-out/example-suite/test-results.xml
+            zig-out/tests/test-results.xml
           reporter: java-junit
           fail-on-error: false
 
@@ -70,8 +64,7 @@ jobs:
           import xml.etree.ElementTree as ET, os, sys
 
           reports = [
-              ("Internal tests", "test-results.xml"),
-              ("Example suite",  "zig-out/example-suite/test-results.xml"),
+              ("Internal tests", "zig-out/tests/test-results.xml"),
           ]
 
           lines = ["## Test Results\n"]
