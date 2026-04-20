@@ -109,7 +109,11 @@ fn resolveOutputPaths(alloc: std.mem.Allocator, config_in: Config) !Config {
     if (result.output_dir) |out_dir| {
         if (result.output_file) |out_file| {
             if (!std.fs.path.isAbsolute(out_file)) {
-                result.output_file = try std.fs.path.join(alloc, &.{ out_dir, out_file });
+                // Always use POSIX-style separators in the joined path so the
+                // value is portable across platforms (Windows accepts forward
+                // slashes in filesystem APIs) and stable in test expectations.
+                const trimmed = std.mem.trimEnd(u8, out_dir, "/\\");
+                result.output_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trimmed, out_file });
             }
         }
     }
