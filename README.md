@@ -215,7 +215,7 @@ The same rule applies to the `--output-file` CLI flag.
 Passing `--consolidate-artifacts` without `--output-file` defaults to `test-results.xml` — which, per the rule above, resolves under `--output-dir`:
 
 ```sh
-your-test-binary --output-dir=zig-out --consolidate-artifacts=true
+zig build test -- --output-dir=zig-out --consolidate-artifacts=true
 # merged XML lands at zig-out/test-results.xml
 ```
 
@@ -224,7 +224,7 @@ your-test-binary --output-dir=zig-out --consolidate-artifacts=true
 If you run zunit outside of the `testSuite` helper (custom runners, non-Zig build systems, manual fan-out), the same consolidation works via CLI flags directly. Each process writes its own fragment and the last one finishes the merge:
 
 ```sh
-your-test-binary \
+zig build test -- \
   --output-dir=zig-out/frags \
   --run-id=$CI_JOB_ID \
   --consolidate-artifacts=true \
