@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -134,7 +135,7 @@ pub const TestSuite = struct {
     zunit_mod: *std.Build.Module,
     run_id: []const u8,
     runner_path: std.Build.LazyPath,
-    cleanup_step: ?*std.Build.Step.Run,
+    cleanup_step: ?*std.Build.Step,
     run_steps: std.ArrayList(*std.Build.Step.Run),
 
     pub fn addFile(self: *TestSuite, path: []const u8) void {
@@ -172,7 +173,7 @@ pub const TestSuite = struct {
         }
 
         if (self.cleanup_step) |cs| {
-            run_t.step.dependOn(&cs.step);
+            run_t.step.dependOn(cs);
         }
 
         self.run_steps.append(self.b.allocator, run_t) catch @panic("OOM");
@@ -217,10 +218,7 @@ pub fn testSuiteFromModule(
     zunit_mod: *std.Build.Module,
     opts: TestSuiteOptions,
 ) *TestSuite {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    const secs: u64 = @intCast(ts.sec);
-    const run_id = b.fmt("run-{x}", .{secs});
+    const run_id = b.fmt("run-{x}", .{b.graph.random_seed});
 
     const runner_src =
         \\const std = @import("std");
@@ -239,10 +237,13 @@ pub fn testSuiteFromModule(
     const wf = b.addWriteFiles();
     const runner_path = wf.add("zunit_test_runner.zig", runner_src);
 
-    const cleanup: ?*std.Build.Step.Run = if (opts.clean)
-        b.addSystemCommand(&.{ "sh", "-c", b.fmt("rm -rf '{s}' || true", .{opts.output_dir}) })
-    else
-        null;
+    const cleanup: ?*std.Build.Step = if (opts.clean) blk: {
+        const run = if (builtin.os.tag == .windows)
+            b.addSystemCommand(&.{ "cmd", "/c", b.fmt("if exist \"{s}\" rmdir /s /q \"{s}\"", .{ opts.output_dir, opts.output_dir }) })
+        else
+            b.addSystemCommand(&.{ "rm", "-rf", opts.output_dir });
+        break :blk &run.step;
+    } else null;
 
     const suite = b.allocator.create(TestSuite) catch @panic("OOM");
     suite.* = .{

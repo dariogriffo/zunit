@@ -15,8 +15,12 @@ permissions:
 
 jobs:
   test:
-    name: Build & Test
-    runs-on: ubuntu-latest
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +40,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results
+          name: test-results-${{ matrix.os }}
           path: |
             test-results.xml
             zig-out/tests/test-results.xml
@@ -49,7 +53,7 @@ jobs:
         uses: dorny/test-reporter@v1
         if: always()
         with:
-          name: Test Results
+          name: Test Results (${{ matrix.os }})
           path: |
             zig-out/tests/test-results.xml
           reporter: java-junit
@@ -59,6 +63,7 @@ jobs:
       # counts from every JUnit XML produced by this workflow.
       - name: Write job summary
         if: always()
+        shell: bash
         run: |
           python3 - <<'EOF'
           import xml.etree.ElementTree as ET, os, sys

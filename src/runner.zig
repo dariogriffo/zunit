@@ -109,7 +109,11 @@ fn resolveOutputPaths(alloc: std.mem.Allocator, config_in: Config) !Config {
     if (result.output_dir) |out_dir| {
         if (result.output_file) |out_file| {
             if (!std.fs.path.isAbsolute(out_file)) {
-                result.output_file = try std.fs.path.join(alloc, &.{ out_dir, out_file });
+                // Always use POSIX-style separators in the joined path so the
+                // value is portable across platforms (Windows accepts forward
+                // slashes in filesystem APIs) and stable in test expectations.
+                const trimmed = std.mem.trimEnd(u8, out_dir, "/\\");
+                result.output_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trimmed, out_file });
             }
         }
     }
@@ -354,7 +358,7 @@ pub fn run(io: std.Io, config_in: Config) !void {
         // (The $ZUNIT_RUN_ID env var fallback is available when callers pass
         // `config.run_id = try zunit.runIdArg(alloc, args)` and set it via
         // the environment; we omit a direct getenv call to avoid the libc dep.)
-        const run_id = config.run_id orelse generateRunId(gpa) catch "zunit-0-0";
+        const run_id = config.run_id orelse generateRunId(io, gpa) catch "zunit-0-0";
 
         writeFragment(io, gpa, out_dir, run_id, records.items, stats) catch |err| {
             std.debug.print("  WARNING: failed to write test fragment: {}\n", .{err});
@@ -383,13 +387,14 @@ pub fn run(io: std.Io, config_in: Config) !void {
 // Fragment helpers
 // -----------------------------------------------------------------------------
 
-/// Generate a unique run id like "zunit-<unix-secs>-<pid>".
-fn generateRunId(alloc: std.mem.Allocator) ![]const u8 {
-    const pid: u32 = @intCast(std.os.linux.getpid());
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-    const secs: u64 = @intCast(ts.sec);
-    return std.fmt.allocPrint(alloc, "zunit-{d}-{d}", .{ secs, pid });
+/// Generate a unique run id like "zunit-<16-hex-random>".
+/// Uses the IO-provided randomness so it works cross-platform without
+/// pulling in OS-specific time/getpid syscalls.
+fn generateRunId(io: std.Io, alloc: std.mem.Allocator) ![]const u8 {
+    var buf: [8]u8 = undefined;
+    io.random(&buf);
+    const id = std.mem.readInt(u64, &buf, .little);
+    return std.fmt.allocPrint(alloc, "zunit-{x}", .{id});
 }
 
 /// Derive a safe filename base from a binary path like "/path/to/foo-test".
@@ -403,7 +408,7 @@ fn basenameNoExt(path: []const u8) []const u8 {
 }
 
 /// Write this process's JUnit XML as a fragment to
-/// `<out_dir>/<run_id>/<argv0-basename>-<pid>.xml`.
+/// `<out_dir>/<run_id>/<random>.xml`.
 fn writeFragment(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -412,9 +417,6 @@ fn writeFragment(
     records: []const TestRecord,
     stats: RunStats,
 ) !void {
-    // Determine argv0 basename for the fragment file name
-    const pid: u32 = @intCast(std.os.linux.getpid());
-
     // Build the directory path: <out_dir>/<run_id>
     const frag_dir_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ out_dir, run_id });
     defer alloc.free(frag_dir_path);
@@ -425,8 +427,13 @@ fn writeFragment(
         else => return err,
     };
 
-    // Build fragment filename: <pid>.xml (simple, unique per process)
-    const frag_filename = try std.fmt.allocPrint(alloc, "{d}.xml", .{pid});
+    // Build a per-process unique filename using IO-provided randomness so
+    // concurrent test binaries writing into the same run_id directory don't
+    // collide. Avoids OS-specific getpid() calls.
+    var rand_buf: [8]u8 = undefined;
+    io.random(&rand_buf);
+    const rand_id = std.mem.readInt(u64, &rand_buf, .little);
+    const frag_filename = try std.fmt.allocPrint(alloc, "{x}.xml", .{rand_id});
     defer alloc.free(frag_filename);
 
     const frag_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ frag_dir_path, frag_filename });
