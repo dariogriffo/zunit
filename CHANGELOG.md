@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/dariogriffo/zunit/compare/v2.1.1...v2.2.0) (2026-04-20)
+
+
+### Features
+
+* runner updates ([#13](https://github.com/dariogriffo/zunit/issues/13)) ([e2a8cac](https://github.com/dariogriffo/zunit/commit/e2a8cac0eeac042c0dc11de4b549b70c7f797565))
+
 ## [2.1.1](https://github.com/dariogriffo/zunit/compare/v2.1.0...v2.1.1) (2026-04-19)
 
 
